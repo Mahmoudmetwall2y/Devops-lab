@@ -1,0 +1,269 @@
+---
+- name: Configure eks-admin and deploy to EKS
+  hosts: eks_admin
+  gather_facts: false
+
+  vars:
+    aws_region: us-east-1
+    cluster_name: devops-eks
+    remote_user_home: /home/ec2-user
+    kube_dir: "{{ remote_user_home }}/.kube"
+    kubeconfig_path: "{{ kube_dir }}/config"
+    manifest_dir: "{{ remote_user_home }}/k8s"
+
+  tasks:
+    - name: Ensure kube directory exists
+      ansible.builtin.file:
+        path: "{{ kube_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure manifest directory exists
+      ansible.builtin.file:
+        path: "{{ manifest_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Verify AWS identity on eks-admin
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sts
+          - get-caller-identity
+      register: caller_identity
+      changed_when: false
+
+    - name: Show AWS identity
+      ansible.builtin.debug:
+        var: caller_identity.stdout
+
+    - name: Create or update kubeconfig on eks-admin
+      ansible.builtin.command:
+        argv:
+          - aws
+          - eks
+          - update-kubeconfig
+          - --region
+          - "{{ aws_region }}"
+          - --name
+          - "{{ cluster_name }}"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: kubeconfig_result
+      changed_when: false
+
+    - name: Copy deployment manifest to eks-admin
+      ansible.builtin.copy:
+        src: files/deployment.yaml
+        dest: "{{ manifest_dir }}/deployment.yaml"
+        mode: "0644"
+
+    - name: Copy service manifest to eks-admin
+      ansible.builtin.copy:
+        src: files/service.yaml
+        dest: "{{ manifest_dir }}/service.yaml"
+        mode: "0644"
+
+    - name: Apply deployment
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - apply
+          - -f
+          - "{{ manifest_dir }}/deployment.yaml"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: deployment_apply
+      changed_when: "'created' in deployment_apply.stdout or 'configured' in deployment_apply.stdout"
+
+    - name: Apply service
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - apply
+          - -f
+          - "{{ manifest_dir }}/service.yaml"
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: service_apply
+      changed_when: "'created' in service_apply.stdout or 'configured' in service_apply.stdout"
+
+    - name: Get nodes
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - nodes
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: nodes_out
+      changed_when: false
+
+    - name: Get pods
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - pods
+          - -o
+          - wide
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: pods_out
+      changed_when: false
+
+    - name: Get service
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - svc
+          - nginx-demo-svc
+          - -o
+          - wide
+      environment:
+        KUBECONFIG: "{{ kubeconfig_path }}"
+      register: svc_out
+      changed_when: false
+
+    - name: Print node output
+      ansible.builtin.debug:
+        var: nodes_out.stdout_lines
+
+    - name: Print pod output
+      ansible.builtin.debug:
+        var: pods_out.stdout_lines
+
+    - name: Print service output
+      ansible.builtin.debug:
+        var: svc_out.stdout_lines
+
+- name: Create SNS + EventBridge notification from eks-admin
+  hosts: eks_admin
+  gather_facts: false
+
+  vars:
+    aws_region: us-east-1
+    notification_email: YOUR_EMAIL@example.com
+    event_pattern:
+      source:
+        - aws.ec2
+      detail-type:
+        - EC2 Instance State-change Notification
+      detail:
+        state:
+          - pending
+          - running
+
+  tasks:
+    - name: Get AWS account id
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sts
+          - get-caller-identity
+          - --query
+          - Account
+          - --output
+          - text
+          - --region
+          - "{{ aws_region }}"
+      register: account_id
+      changed_when: false
+
+    - name: Create SNS topic
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sns
+          - create-topic
+          - --name
+          - ec2-created-alerts
+          - --query
+          - TopicArn
+          - --output
+          - text
+          - --region
+          - "{{ aws_region }}"
+      register: topic_arn
+      changed_when: false
+
+    - name: Subscribe email to SNS topic
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sns
+          - subscribe
+          - --topic-arn
+          - "{{ topic_arn.stdout }}"
+          - --protocol
+          - email
+          - --notification-endpoint
+          - "{{ notification_email }}"
+          - --region
+          - "{{ aws_region }}"
+      changed_when: false
+
+    - name: Build SNS topic policy JSON
+      ansible.builtin.set_fact:
+        sns_topic_policy: >-
+          {{
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "AllowEventBridgePublish",
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Service": "events.amazonaws.com"
+                  },
+                  "Action": "sns:Publish",
+                  "Resource": topic_arn.stdout
+                }
+              ]
+            } | to_json
+          }}
+
+    - name: Attach SNS topic policy
+      ansible.builtin.command:
+        argv:
+          - aws
+          - sns
+          - set-topic-attributes
+          - --topic-arn
+          - "{{ topic_arn.stdout }}"
+          - --attribute-name
+          - Policy
+          - --attribute-value
+          - "{{ sns_topic_policy }}"
+          - --region
+          - "{{ aws_region }}"
+      changed_when: false
+
+    - name: Create EventBridge rule
+      ansible.builtin.command:
+        argv:
+          - aws
+          - events
+          - put-rule
+          - --name
+          - EC2InstanceCreatedNotify
+          - --event-pattern
+          - "{{ event_pattern | to_json }}"
+          - --region
+          - "{{ aws_region }}"
+      changed_when: false
+
+    - name: Add SNS topic as EventBridge target
+      ansible.builtin.command:
+        argv:
+          - aws
+          - events
+          - put-targets
+          - --rule
+          - EC2InstanceCreatedNotify
+          - --targets
+          - "Id=1,Arn={{ topic_arn.stdout }}"
+          - --region
+          - "{{ aws_region }}"
+      changed_when: false
